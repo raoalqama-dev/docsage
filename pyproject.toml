@@ -24,11 +24,13 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "numpy>=1.26",
     "pydantic>=2.6",
     "pypdf[crypto]>=4.3.1",
 ]
 
 [project.optional-dependencies]
+embed = ["fastembed>=0.4.0"]
 dev = [
     "mypy>=1.11",
     "pytest>=8.0",

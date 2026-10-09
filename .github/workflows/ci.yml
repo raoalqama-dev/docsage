@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[dev,embed]"
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
@@ -40,17 +40,25 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[dev,embed]"
       - run: pytest --cov --cov-report=term-missing
 
   minimum-versions:
-    name: Tests with the oldest supported dependencies
+    name: Tests with the oldest dependencies (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            extras: ""
+          - name: embed extra
+            extras: "[embed]"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
           activate-environment: true
-      - run: uv pip install --resolution lowest-direct -e . "pytest>=8"
+      - run: uv pip install --resolution lowest-direct -e ".${{ matrix.extras }}" "pytest>=8"
       - run: python -m pytest -p no:cacheprovider
