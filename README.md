@@ -9,9 +9,10 @@ guessing. It talks to any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio or
 a hosted API) over plain HTTP with no vendor SDK, and runs its embedding and
 reranking models locally.
 
-**Status:** early development. Ingestion works: Markdown, text, HTML and PDF
-files are split into chunks that follow their headings, and stored in a single
-SQLite file. Search, answers and evaluation are next on the
+**Status:** early development. Ingestion and search work: Markdown, text, HTML
+and PDF files are split into chunks that follow their headings and stored in a
+single SQLite file, and `docsage search` finds them by BM25, by dense vectors or
+by both fused. Reranking, answers and evaluation are next on the
 [roadmap](#roadmap).
 
 ## Quick start
@@ -52,6 +53,23 @@ docsage collections
 collection  documents   chunks     tokens
 projects            5       87     24,517
 ```
+
+```sh
+docsage search "ECONNRESET snapshot" --collection projects -k 3
+```
+
+```text
+ 1  0.0325  raft.md > Raft notes > Snapshots  [bm25 #1, dense #2]
+      Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers.
+ 2  0.0325  troubleshooting.md > Troubleshooting > Connection errors  [bm25 #2, dense #1]
+      The client logs ECONNRESET when the peer closes the socket before the response is complete. Retry idempotent requests with exponential backoff.
+ 3  0.0159  raft.md > Raft notes > Elections  [dense #3]
+      A follower that hears nothing from a leader before its election timeout becomes a candidate, increments its term and asks the other servers for votes. A candidate that gathers votes from a majority...
+```
+
+(That search ran against a folder of three small notes, `raft.md`,
+`troubleshooting.md` and `todo.txt`, and the first run also printed `embedded 6
+chunks with hashing-512` on standard error.)
 
 `docsage ingest PATH...` takes files and directories; directories are searched
 recursively, skipping hidden files and folders. `--collection` (or `-c`) names
@@ -105,8 +123,8 @@ Counts add up, so the count stored for a chunk is the sum of its sentences'.
 ### The store
 
 A collection lives in a SQLite file, `docsage.db` unless `--db` or
-`DOCSAGE_DB` says otherwise, with three tables: `collections`, `documents` and
-`chunks`. The schema is versioned with `PRAGMA user_version`, and a newer
+`DOCSAGE_DB` says otherwise, with the tables `collections`, `documents`,
+`chunks` and `embeddings`, and the FTS5 index `chunks_fts`. The schema is versioned with `PRAGMA user_version`, and a newer
 docsage upgrades an older file when it opens it.
 
 A document is identified by its **source**: its path relative to the directory
@@ -123,6 +141,88 @@ Each document records the SHA-256 of its file and the pipeline that chunked it
 - **changed**, or chunked with other options: its chunks are replaced in one
   transaction, and it keeps its document id.
 
+## Search
+
+```sh
+docsage search QUERY [--collection NAME] [--mode bm25|dense|hybrid] [-k 10]
+```
+
+Each result shows its rank, score, source with heading path and PDF pages, and
+the start of the chunk. In hybrid mode it also shows the position the chunk had
+in each retriever's list, so you can see which one found it. Scores mean
+different things per mode (BM25 score, cosine similarity, fused score) and are
+only comparable within one search.
+
+### BM25
+
+Lexical search uses SQLite's FTS5 with the `porter unicode61` tokenizer, so
+case, accents and word endings do not matter (`elections` finds `election`).
+The text and the heading path are indexed, and a word in the text counts twice
+as much as one in a heading. The index is kept in step with the chunks by
+triggers, so there is nothing to rebuild after ingesting.
+
+**User text never reaches FTS5 syntax.** A query is cut into words (letters and
+digits in any script), and each is sent as a double-quoted string, joined with
+`OR`. `AND`, `NOT`, `NEAR`, `*`, `-`, `column:` filters, parentheses and
+unbalanced quotes are therefore ordinary punctuation or ordinary words:
+
+```sh
+docsage search 'snapshot* AND ("unbalanced' -c projects --mode bm25 -k 1
+```
+
+```text
+ 1  2.1116  raft.md > Raft notes > Snapshots
+      Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers.
+```
+
+Because a query is an `OR` of its words, a chunk needs only one of them, and
+BM25 ranks the chunks with the most and the rarest words first. A word found in
+more than half of the chunks of a small collection scores about zero, so a
+query made of such words returns chunks with scores near 0.
+
+### Dense
+
+Chunks are embedded by an `Embedder`, and a query is compared with every vector
+of the collection as a dot product of unit vectors (cosine similarity),
+exactly, with numpy. Vectors are stored in the database as float32 blobs, keyed
+by chunk and by the embedder's name, so several embedders can share a database,
+and a changed document loses its vectors along with its chunks. **The first
+dense or hybrid search embeds whatever has no vector yet**, and is the only
+slow one.
+
+Two embedders are included, chosen with `--embedder` or `DOCSAGE_EMBEDDER`:
+
+- `hashing` (the default): hashed words and character trigrams in 512 buckets.
+  It needs no model and no download, is fully deterministic, and finds chunks
+  that share words or word fragments with the query. **It knows nothing about
+  meaning**, so it does not match paraphrases; it is there so that dense search
+  works anywhere, and for tests.
+- `fastembed`: a local ONNX model through
+  [fastembed](https://qdrant.github.io/fastembed/), `BAAI/bge-small-en-v1.5`
+  unless `DOCSAGE_EMBED_MODEL` names another. Install it with
+  `pip install 'docsage[embed]'`; the model is downloaded on first use. This is
+  the embedder meant for paraphrases.
+
+Anything with `name`, `dimension`, `embed_documents` and `embed_query` is an
+`Embedder`.
+
+### Hybrid
+
+Hybrid search takes the top candidates of BM25 and of dense retrieval (at least
+50 each) and fuses their *ranks* with reciprocal rank fusion: a chunk scores the
+sum over the lists of `weight / (k + rank)`, with `k = 60`. Only positions
+matter, so BM25 scores and cosine similarities need no calibration against each
+other. `--bm25-weight` and `--dense-weight` scale the lists (0 leaves one out
+altogether), and `--rrf-k` sets `k`. Ties go to the chunk with the better rank
+in either list, then to the one BM25 ranked first.
+
+In the example above, `ECONNRESET` is a token no embedding model would know, so
+only BM25 finds the troubleshooting note by it, while the dense list adds the
+election chunk, which BM25 never returned. The tests check both directions on a
+fixture corpus with a test embedder that maps synonyms to the same dimension: a
+keyword-only match that dense retrieval misses, and a paraphrase-only match
+with no word in common with the query that BM25 misses. Hybrid returns both.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -130,6 +230,8 @@ Each document records the SHA-256 of its file and the pipeline that chunked it
 | `DOCSAGE_DB` | `docsage.db` | the SQLite database |
 | `DOCSAGE_CHUNK_TOKENS` | `400` | the token budget of a chunk |
 | `DOCSAGE_CHUNK_OVERLAP` | `60` | tokens each chunk repeats from the previous one; less than the budget |
+| `DOCSAGE_EMBEDDER` | `hashing` | `hashing` or `fastembed` |
+| `DOCSAGE_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | the fastembed model |
 
 Command-line options take precedence over the environment. An invalid value is
 reported with its variable's name, and the command exits with status 2.
@@ -137,7 +239,7 @@ reported with its variable's name, and the command exits with status 2.
 ## Roadmap
 
 - [x] Ingestion: loaders, chunking, the SQLite store and `docsage ingest`
-- [ ] Hybrid retrieval: BM25 through SQLite FTS5, dense vectors, reciprocal rank fusion and `docsage search`
+- [x] Hybrid retrieval: BM25 through SQLite FTS5, dense vectors, reciprocal rank fusion and `docsage search`
 - [ ] Reranking with a cross-encoder, MMR and context assembly
 - [ ] Answers with citations from any OpenAI-compatible endpoint: `docsage ask`
 - [ ] An evaluation suite: retrieval and answer metrics, and `docsage eval`
@@ -147,12 +249,15 @@ reported with its variable's name, and the command exits with status 2.
 ## Development
 
 ```sh
-pip install -e ".[dev]"
+pip install -e ".[dev,embed]"
 ruff check . && ruff format --check .
 mypy
 pytest --cov
 ```
 
-CI runs the same checks, the tests on Python 3.11 to 3.14, and the tests again
-against the oldest dependency versions `pyproject.toml` allows. The tests build
-their fixture documents, PDFs included, as they run.
+CI runs the same checks, the tests on Python 3.11 to 3.14 with every extra
+installed, and the tests again against the oldest dependency versions
+`pyproject.toml` allows, once for the core and once with the `embed` extra. The
+tests build their fixture documents, PDFs included, as they run. Embedders in
+the tests are fakes, so no model is downloaded; one test only checks that the
+installed fastembed offers the methods docsage calls.
