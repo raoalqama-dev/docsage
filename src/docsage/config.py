@@ -5,15 +5,19 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from docsage.retrieval.dense import DEFAULT_FASTEMBED_MODEL
 
 #: Each setting and the environment variable it is read from.
 ENV_VARS: dict[str, str] = {
     "db_path": "DOCSAGE_DB",
     "chunk_tokens": "DOCSAGE_CHUNK_TOKENS",
     "chunk_overlap": "DOCSAGE_CHUNK_OVERLAP",
+    "embedder": "DOCSAGE_EMBEDDER",
+    "embed_model": "DOCSAGE_EMBED_MODEL",
 }
 
 
@@ -27,6 +31,9 @@ class Settings(BaseModel):
     db_path: Path = Path("docsage.db")
     chunk_tokens: int = Field(default=400, ge=1)
     chunk_overlap: int = Field(default=60, ge=0)
+    embedder: Literal["hashing", "fastembed"] = "hashing"
+    embed_model: str = Field(default=DEFAULT_FASTEMBED_MODEL, min_length=1)
+    """The fastembed model; the hashing embedder has no model."""
 
     @model_validator(mode="after")
     def _overlap_below_chunk_size(self) -> Self:

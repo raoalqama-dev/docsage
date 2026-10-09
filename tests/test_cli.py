@@ -10,11 +10,18 @@ import pytest
 from docsage import __version__
 from docsage.cli import EXIT_FAILED, EXIT_OK, EXIT_USAGE, main
 from docsage.store import Store
+from fixtures import make_pdf
 
 
 @pytest.fixture(autouse=True)
 def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("DOCSAGE_DB", "DOCSAGE_CHUNK_TOKENS", "DOCSAGE_CHUNK_OVERLAP"):
+    for name in (
+        "DOCSAGE_DB",
+        "DOCSAGE_CHUNK_TOKENS",
+        "DOCSAGE_CHUNK_OVERLAP",
+        "DOCSAGE_EMBEDDER",
+        "DOCSAGE_EMBED_MODEL",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -121,6 +128,138 @@ class TestIngest:
             main(["ingest", str(corpus), *args])
         assert caught.value.code == EXIT_USAGE
         assert message in capsys.readouterr().err
+
+
+class TestSearch:
+    @pytest.fixture
+    def db(self, tmp_path: Path) -> str:
+        root = tmp_path / "docs"
+        root.mkdir()
+        (root / "raft.md").write_text(
+            "# Raft\n\n## Elections\n\nA candidate asks the followers for votes. "
+            + "Votes decide the leader. " * 12,
+            encoding="utf-8",
+        )
+        (root / "cooking.txt").write_text("Whisk the eggs.", encoding="utf-8")
+        (root / "paper.pdf").write_bytes(
+            make_pdf([[["Page one."]], [["Quorums overlap on two pages."]]])
+        )
+        db = str(tmp_path / "x.db")
+        assert run("--db", db, "ingest", str(root), "-c", "demo")[0] == EXIT_OK
+        return db
+
+    def test_bm25(self, db: str) -> None:
+        code, out, err = run("--db", db, "search", "votes", "-c", "demo", "--mode", "bm25")
+        assert (code, err) == (EXIT_OK, "")
+        lines = out.splitlines()
+        assert len(lines) == 2
+        assert lines[0].startswith(" 1  ")
+        assert lines[0].endswith("raft.md > Raft > Elections")
+        assert lines[1].startswith("      A candidate asks the followers for votes. Votes decide")
+        assert lines[1].endswith("...")
+        assert len(lines[1]) == 6 + 200
+
+    def test_bm25_score_is_shown(self, db: str) -> None:
+        _, out, _ = run("--db", db, "search", "eggs", "-c", "demo", "-m", "bm25")
+        score = out.split()[1]
+        assert out.splitlines() == [f" 1  {score}  cooking.txt", "      Whisk the eggs."]
+        assert float(score) > 0
+
+    def test_hybrid_is_the_default_and_embeds_on_the_first_run(self, db: str) -> None:
+        code, out, err = run("--db", db, "search", "votes", "-c", "demo")
+        assert code == EXIT_OK
+        assert err == "embedded 3 chunks with hashing-512\n"
+        first = out.splitlines()[0]
+        assert first.startswith(" 1  0.03")
+        assert first.endswith("raft.md > Raft > Elections  [bm25 #1, dense #1]")
+        code, _, err = run("--db", db, "search", "votes", "-c", "demo")
+        assert (code, err) == (EXIT_OK, "")
+
+    def test_dense(self, db: str) -> None:
+        code, out, _ = run("--db", db, "search", "whisk eggs", "-c", "demo", "--mode", "dense")
+        assert code == EXIT_OK
+        assert "cooking.txt" in out.splitlines()[0]
+        assert "[" not in out.splitlines()[0]
+
+    def test_pdf_pages(self, db: str) -> None:
+        _, out, _ = run("--db", db, "search", "quorums", "-c", "demo", "-m", "bm25")
+        assert out.splitlines()[0].endswith("paper.pdf  p.1-2")
+
+    def test_k(self, db: str) -> None:
+        _, out, _ = run("--db", db, "search", "the", "-c", "demo", "-m", "bm25", "-k", "1")
+        assert len(out.splitlines()) == 2
+
+    def test_no_results(self, db: str) -> None:
+        assert run("--db", db, "search", "kubernetes", "-c", "demo", "-m", "bm25") == (
+            EXIT_OK,
+            "no results\n",
+            "",
+        )
+
+    def test_operators_in_the_query_are_just_text(self, db: str) -> None:
+        query = '"votes" AND NEAR( -'
+        code, out, err = run("--db", db, "search", query, "-c", "demo", "-m", "bm25")
+        assert (code, err) == (EXIT_OK, "")
+        assert "raft.md" in out
+
+    def test_weights_and_rrf_k(self, db: str) -> None:
+        code, out, _ = run(
+            "--db", db, "search", "votes", "-c", "demo", "--bm25-weight", "2", "--dense-weight",
+            "0", "--rrf-k", "0",
+        )  # fmt: skip
+        assert code == EXIT_OK
+        assert out.splitlines()[0].startswith(" 1  2.0000  ")
+
+    def test_embedder_from_the_environment(self, db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "fastembed", None)
+        monkeypatch.setenv("DOCSAGE_EMBEDDER", "fastembed")
+        code, _, err = run("--db", db, "search", "votes", "-c", "demo")
+        assert code == EXIT_USAGE
+        assert "needs the embed extra" in err
+        code, _, _ = run("--db", db, "search", "votes", "-c", "demo", "--embedder", "hashing")
+        assert code == EXIT_OK
+
+    def test_bm25_needs_no_embedder(self, db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DOCSAGE_EMBEDDER", "fastembed")
+        monkeypatch.setitem(sys.modules, "fastembed", None)
+        assert run("--db", db, "search", "votes", "-c", "demo", "-m", "bm25")[0] == EXIT_OK
+
+    def test_unknown_collection(self, db: str) -> None:
+        code, _, err = run("--db", db, "search", "x", "-c", "nope")
+        assert code == EXIT_USAGE
+        assert err == "docsage: no collection 'nope'\n"
+
+    def test_missing_database_is_not_created(self, tmp_path: Path) -> None:
+        code, _, err = run("--db", str(tmp_path / "none.db"), "search", "x")
+        assert code == EXIT_USAGE
+        assert "no database at" in err
+        assert not (tmp_path / "none.db").exists()
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            (["-k", "0"], "must be at least 1"),
+            (["--mode", "fuzzy"], "invalid"),
+            (["--bm25-weight", "-1"], "must be a finite number, not negative"),
+            (["--dense-weight", "nan"], "must be a finite number, not negative"),
+            (["--dense-weight", "x"], "not a number: 'x'"),
+            (["--rrf-k", "-1"], "must not be negative"),
+            (["--embedder", "openai"], "invalid choice"),
+        ],
+    )
+    def test_bad_arguments(
+        self, capsys: pytest.CaptureFixture[str], args: list[str], message: str
+    ) -> None:
+        with pytest.raises(SystemExit) as caught:
+            main(["search", "x", *args])
+        assert caught.value.code == EXIT_USAGE
+        assert message in capsys.readouterr().err
+
+    def test_invalid_environment_exits_2(self, db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DOCSAGE_EMBEDDER", "openai")
+        code, _, err = run("--db", db, "search", "votes", "-c", "demo")
+        assert code == EXIT_USAGE
+        assert "DOCSAGE_EMBEDDER: Input should be 'hashing' or 'fastembed'" in err
 
 
 class TestCollections:

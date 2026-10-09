@@ -9,7 +9,11 @@ from docsage.config import ConfigError, Settings, load_settings
 
 def test_defaults() -> None:
     assert load_settings({}) == Settings(
-        db_path=Path("docsage.db"), chunk_tokens=400, chunk_overlap=60
+        db_path=Path("docsage.db"),
+        chunk_tokens=400,
+        chunk_overlap=60,
+        embedder="hashing",
+        embed_model="BAAI/bge-small-en-v1.5",
     )
 
 
@@ -18,6 +22,16 @@ def test_values_from_the_environment() -> None:
         {"DOCSAGE_DB": "data/x.db", "DOCSAGE_CHUNK_TOKENS": "256", "DOCSAGE_CHUNK_OVERLAP": "0"}
     )
     assert settings == Settings(db_path=Path("data/x.db"), chunk_tokens=256, chunk_overlap=0)
+
+
+def test_embedder_settings() -> None:
+    settings = load_settings({"DOCSAGE_EMBEDDER": "fastembed", "DOCSAGE_EMBED_MODEL": "org/m"})
+    assert (settings.embedder, settings.embed_model) == ("fastembed", "org/m")
+
+
+def test_an_unknown_embedder_is_named() -> None:
+    with pytest.raises(ConfigError, match="DOCSAGE_EMBEDDER: Input should be 'hashing' or"):
+        load_settings({"DOCSAGE_EMBEDDER": "openai"})
 
 
 def test_empty_variables_are_unset() -> None:

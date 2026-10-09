@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -12,6 +13,9 @@ from docsage import __version__
 from docsage.config import ConfigError, Settings, load_settings
 from docsage.ingest.chunking import ChunkingOptions
 from docsage.ingest.pipeline import Outcome, ingest
+from docsage.retrieval.dense import EmbedderError, create_embedder
+from docsage.retrieval.fusion import DEFAULT_K
+from docsage.retrieval.search import Hit, Mode, search
 from docsage.store import Store, StoreError
 
 EXIT_OK = 0
@@ -44,6 +48,16 @@ def _non_negative_int(text: str) -> int:
         raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
     if value < 0:
         raise argparse.ArgumentTypeError("must not be negative")
+    return value
+
+
+def _weight(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be a finite number, not negative")
     return value
 
 
@@ -91,6 +105,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="tokens repeated from the previous chunk (default: $DOCSAGE_CHUNK_OVERLAP or 60)",
     )
 
+    search_parser = commands.add_parser(
+        "search",
+        help="find the chunks that match a query",
+        description=(
+            "Search a collection with BM25, dense vectors, or both fused with reciprocal "
+            "rank fusion. Dense and hybrid searches embed any chunks that have no vector "
+            "yet, which is slow only the first time."
+        ),
+    )
+    search_parser.add_argument("query", metavar="QUERY")
+    search_parser.add_argument(
+        "--collection",
+        "-c",
+        default=DEFAULT_COLLECTION,
+        metavar="NAME",
+        help=f"the collection to search (default: {DEFAULT_COLLECTION})",
+    )
+    search_parser.add_argument(
+        "--mode",
+        "-m",
+        type=Mode,
+        choices=list(Mode),
+        default=Mode.HYBRID,
+        metavar="{bm25,dense,hybrid}",
+        help="how to search (default: hybrid)",
+    )
+    search_parser.add_argument(
+        "-k", type=_positive_int, default=10, metavar="N", help="results to show (default: 10)"
+    )
+    search_parser.add_argument(
+        "--embedder",
+        choices=["hashing", "fastembed"],
+        help="the embedder for dense and hybrid searches (default: $DOCSAGE_EMBEDDER or hashing)",
+    )
+    search_parser.add_argument(
+        "--bm25-weight",
+        type=_weight,
+        default=1.0,
+        metavar="W",
+        help="the weight of BM25 in a hybrid search (default: 1)",
+    )
+    search_parser.add_argument(
+        "--dense-weight",
+        type=_weight,
+        default=1.0,
+        metavar="W",
+        help="the weight of dense retrieval in a hybrid search (default: 1)",
+    )
+    search_parser.add_argument(
+        "--rrf-k",
+        type=_non_negative_int,
+        default=DEFAULT_K,
+        metavar="K",
+        help=f"the rank constant of reciprocal rank fusion (default: {DEFAULT_K})",
+    )
+
     commands.add_parser(
         "collections",
         help="list collections",
@@ -129,6 +199,63 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings, out: TextIO) -> int
     return EXIT_FAILED if report.failed else EXIT_OK
 
 
+SNIPPET_CHARS = 200
+
+
+def _snippet(text: str) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= SNIPPET_CHARS else flat[: SNIPPET_CHARS - 3].rstrip() + "..."
+
+
+def _location(hit: Hit) -> str:
+    chunk = hit.chunk.chunk
+    parts = [" > ".join((hit.chunk.source, *chunk.heading_path))]
+    if chunk.page is not None:
+        same = chunk.page == chunk.page_end
+        pages = str(chunk.page) if same else f"{chunk.page}-{chunk.page_end}"
+        parts.append(f"p.{pages}")
+    return "  ".join(parts)
+
+
+def _ranks(hit: Hit) -> str:
+    ranks = [("bm25", hit.bm25_rank), ("dense", hit.dense_rank)]
+    return ", ".join(f"{name} #{rank}" for name, rank in ranks if rank is not None)
+
+
+def cmd_search(args: argparse.Namespace, settings: Settings, out: TextIO, err: TextIO) -> int:
+    path = _db_path(args, settings)
+    if not path.exists():
+        raise CommandError(f"no database at {path}; run docsage ingest first")
+    embedder = None
+    if args.mode is not Mode.BM25:
+        embedder = create_embedder(args.embedder or settings.embedder, settings.embed_model)
+    with Store(path) as store:
+        collection = store.collection(args.collection)
+        if collection is None:
+            raise CommandError(f"no collection {args.collection!r}")
+        result = search(
+            store,
+            collection,
+            args.query,
+            mode=args.mode,
+            k=args.k,
+            embedder=embedder,
+            bm25_weight=args.bm25_weight,
+            dense_weight=args.dense_weight,
+            rrf_k=args.rrf_k,
+        )
+    if embedder and result.embedded:
+        err.write(f"embedded {result.embedded} chunks with {embedder.name}\n")
+    if not result.hits:
+        out.write("no results\n")
+        return EXIT_OK
+    for position, hit in enumerate(result.hits, start=1):
+        detail = f"  [{_ranks(hit)}]" if args.mode is Mode.HYBRID else ""
+        out.write(f"{position:>2}  {hit.score:.4f}  {_location(hit)}{detail}\n")
+        out.write(f"      {_snippet(hit.chunk.chunk.text)}\n")
+    return EXIT_OK
+
+
 def cmd_collections(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:
     path = _db_path(args, settings)
     if not path.exists():
@@ -145,9 +272,16 @@ def cmd_collections(args: argparse.Namespace, settings: Settings, out: TextIO) -
     return EXIT_OK
 
 
-COMMANDS: dict[str, Callable[[argparse.Namespace, Settings, TextIO], int]] = {
-    "ingest": cmd_ingest,
-    "collections": cmd_collections,
+def _with_err(
+    command: Callable[[argparse.Namespace, Settings, TextIO], int],
+) -> Callable[[argparse.Namespace, Settings, TextIO, TextIO], int]:
+    return lambda args, settings, out, err: command(args, settings, out)
+
+
+COMMANDS: dict[str, Callable[[argparse.Namespace, Settings, TextIO, TextIO], int]] = {
+    "ingest": _with_err(cmd_ingest),
+    "search": cmd_search,
+    "collections": _with_err(cmd_collections),
 }
 
 
@@ -159,7 +293,7 @@ def main(
     args = build_parser().parse_args(argv)
     try:
         settings = load_settings()
-        return COMMANDS[args.command](args, settings, out)
-    except (CommandError, ConfigError, StoreError) as exc:
+        return COMMANDS[args.command](args, settings, out, err)
+    except (CommandError, ConfigError, EmbedderError, StoreError) as exc:
         err.write(f"docsage: {exc}\n")
         return EXIT_USAGE
