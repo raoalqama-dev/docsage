@@ -51,9 +51,43 @@ _MIGRATIONS: tuple[str, ...] = (
         UNIQUE (document_id, ordinal)
     );
     """,
+    """
+    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+        text,
+        heading_path,
+        content = 'chunks',
+        content_rowid = 'id',
+        tokenize = 'porter unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER chunks_fts_insert AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts (rowid, text, heading_path)
+        VALUES (new.id, new.text, new.heading_path);
+    END;
+    CREATE TRIGGER chunks_fts_delete AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts (chunks_fts, rowid, text, heading_path)
+        VALUES ('delete', old.id, old.text, old.heading_path);
+    END;
+    CREATE TRIGGER chunks_fts_update AFTER UPDATE OF text, heading_path ON chunks BEGIN
+        INSERT INTO chunks_fts (chunks_fts, rowid, text, heading_path)
+        VALUES ('delete', old.id, old.text, old.heading_path);
+        INSERT INTO chunks_fts (rowid, text, heading_path)
+        VALUES (new.id, new.text, new.heading_path);
+    END;
+    INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild');
+    CREATE TABLE embeddings (
+        chunk_id INTEGER NOT NULL REFERENCES chunks (id) ON DELETE CASCADE,
+        model TEXT NOT NULL,
+        dimension INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        PRIMARY KEY (chunk_id, model)
+    ) WITHOUT ROWID;
+    """,
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
+
+#: SQLite's default limit on the variables in one statement is 999 before 3.32.
+_MAX_VARIABLES = 500
 
 _COLLECTION_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
@@ -101,6 +135,14 @@ class DocumentRecord:
     content_hash: str
     pipeline: str
     ingested_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingRow:
+    """A stored vector: float32 values as little-endian bytes."""
+
+    chunk_id: int
+    vector: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +363,99 @@ class Store:
             (document_id,),
         ).fetchall()
         return [_stored_chunk(row) for row in rows]
+
+    def chunks_by_id(self, chunk_ids: Sequence[int]) -> dict[int, StoredChunk]:
+        """The chunks with these ids, which must exist, keyed by id."""
+        found: dict[int, StoredChunk] = {}
+        for start in range(0, len(chunk_ids), _MAX_VARIABLES):
+            batch = chunk_ids[start : start + _MAX_VARIABLES]
+            rows = self._db.execute(
+                f"""
+                SELECT k.*, d.source, d.title FROM chunks k JOIN documents d ON d.id = k.document_id
+                WHERE k.id IN ({",".join("?" * len(batch))})
+                """,
+                batch,
+            ).fetchall()
+            found.update((row["id"], _stored_chunk(row)) for row in rows)
+        return found
+
+    # Full-text search
+
+    def fts_search(self, collection: Collection, match: str, limit: int) -> list[tuple[int, float]]:
+        """Chunk ids of a collection with their BM25 scores, best first.
+
+        ``match`` is an FTS5 expression and must come from
+        :func:`docsage.retrieval.bm25.build_match`. Scores are positive, higher
+        is better. Words in the text weigh twice as much as words in the headings.
+        """
+        rows = self._db.execute(
+            """
+            SELECT k.id, -bm25(chunks_fts, 2.0, 1.0) AS score
+            FROM chunks_fts
+            JOIN chunks k ON k.id = chunks_fts.rowid
+            JOIN documents d ON d.id = k.document_id
+            WHERE chunks_fts MATCH ? AND d.collection_id = ?
+            ORDER BY score DESC, k.id
+            LIMIT ?
+            """,
+            (match, collection.id, limit),
+        ).fetchall()
+        return [(row["id"], row["score"]) for row in rows]
+
+    # Embeddings
+
+    def unembedded_chunks(self, collection: Collection, model: str) -> list[tuple[int, str]]:
+        """``(id, text)`` of the collection's chunks that have no vector for ``model``."""
+        rows = self._db.execute(
+            """
+            SELECT k.id, k.text
+            FROM chunks k
+            JOIN documents d ON d.id = k.document_id
+            WHERE d.collection_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM embeddings e WHERE e.chunk_id = k.id AND e.model = ?
+              )
+            ORDER BY k.id
+            """,
+            (collection.id, model),
+        ).fetchall()
+        return [(row["id"], row["text"]) for row in rows]
+
+    def put_embeddings(self, model: str, dimension: int, rows: Sequence[EmbeddingRow]) -> None:
+        """Store vectors of ``dimension`` float32 values, replacing any for the same chunks."""
+        for row in rows:
+            if len(row.vector) != dimension * 4:
+                raise StoreError(
+                    f"vector for chunk {row.chunk_id} has {len(row.vector)} bytes, "
+                    f"expected {dimension * 4}"
+                )
+        with self.transaction():
+            self._db.executemany(
+                "INSERT OR REPLACE INTO embeddings (chunk_id, model, dimension, vector) "
+                "VALUES (?, ?, ?, ?)",
+                [(row.chunk_id, model, dimension, row.vector) for row in rows],
+            )
+
+    def embeddings(self, collection: Collection, model: str) -> tuple[int, list[EmbeddingRow]]:
+        """The dimension and the vectors of a collection's chunks for ``model``, by chunk id."""
+        rows = self._db.execute(
+            """
+            SELECT e.chunk_id, e.dimension, e.vector
+            FROM embeddings e
+            JOIN chunks k ON k.id = e.chunk_id
+            JOIN documents d ON d.id = k.document_id
+            WHERE d.collection_id = ? AND e.model = ?
+            ORDER BY e.chunk_id
+            """,
+            (collection.id, model),
+        ).fetchall()
+        dimensions = {row["dimension"] for row in rows}
+        if len(dimensions) > 1:
+            raise StoreError(f"vectors for {model!r} have different dimensions: {dimensions}")
+        return (
+            dimensions.pop() if dimensions else 0,
+            [EmbeddingRow(row["chunk_id"], row["vector"]) for row in rows],
+        )
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import struct
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from docsage.models import Chunk
 from docsage.store import (
     SCHEMA_VERSION,
     Collection,
+    EmbeddingRow,
     Store,
     StoreError,
     content_hash,
@@ -47,6 +49,15 @@ def put(
     return record.id
 
 
+def put_chunks(
+    store: Store, collection: Collection, source: str, *chunks: Chunk, digest: str = "h1"
+) -> list[int]:
+    """Like :func:`put`, returning the ids of the stored chunks."""
+    return [
+        stored.id for stored in store.chunks(put(store, collection, source, *chunks, digest=digest))
+    ]
+
+
 def test_content_hash_is_sha256() -> None:
     assert content_hash(b"abc") == (
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -71,8 +82,33 @@ class TestSchema:
         db = sqlite3.connect(tmp_path / "a.db")
         assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert {"collections", "documents", "chunks"} <= tables
+        assert {"collections", "documents", "chunks", "chunks_fts", "embeddings"} <= tables
         db.close()
+
+    def test_a_version_1_database_gains_the_search_index_with_its_data(
+        self, tmp_path: Path
+    ) -> None:
+        import docsage.store
+
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript(docsage.store._MIGRATIONS[0])
+        old.execute("INSERT INTO collections (id, name, created_at) VALUES (1, 'c', 'now')")
+        old.execute(
+            "INSERT INTO documents (id, collection_id, source, title, format, content_hash, "
+            "pipeline, ingested_at) VALUES (1, 1, 'a.txt', 'A', 'text', 'h', 'p', 'now')"
+        )
+        old.execute(
+            "INSERT INTO chunks (id, document_id, ordinal, text, heading_path, token_count) "
+            "VALUES (1, 1, 0, 'a pangolin was here', '[]', 4)"
+        )
+        old.execute("PRAGMA user_version = 1")
+        old.commit()
+        old.close()
+        with Store(path) as upgraded:
+            collection = upgraded.collection("c")
+            assert collection is not None
+            assert [i for i, _ in upgraded.fts_search(collection, '"pangolin"', 5)] == [1]
 
     def test_reopening_keeps_data(self, tmp_path: Path) -> None:
         with Store(tmp_path / "a.db") as first:
@@ -103,13 +139,16 @@ class TestSchema:
     ) -> None:
         import docsage.store
 
-        broken = (docsage.store._MIGRATIONS[0], "CREATE TABLE extra (x); SELECT nonsense FROM;")
+        broken = (
+            *docsage.store._MIGRATIONS,
+            "CREATE TABLE extra (x); SELECT nonsense FROM;",
+        )
         monkeypatch.setattr(docsage.store, "_MIGRATIONS", broken)
-        monkeypatch.setattr(docsage.store, "SCHEMA_VERSION", 2)
+        monkeypatch.setattr(docsage.store, "SCHEMA_VERSION", len(broken))
         with pytest.raises(StoreError, match="cannot open"):
             Store(tmp_path / "m.db")
         db = sqlite3.connect(tmp_path / "m.db")
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "extra" not in tables
         db.close()
@@ -201,3 +240,95 @@ class TestDocuments:
         record = store.document(docs, "a.txt")
         assert record is not None
         assert record.content_hash == "h1"
+
+
+class TestChunksById:
+    def test_returns_the_requested_chunks(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        ids = [
+            i
+            for source in ("a.txt", "b.txt")
+            for i in put_chunks(store, docs, source, chunk(0, source))
+        ]
+        found = store.chunks_by_id([ids[1], ids[0]])
+        assert {i: stored.source for i, stored in found.items()} == {
+            ids[0]: "a.txt",
+            ids[1]: "b.txt",
+        }
+        assert found[ids[0]].title == "A.TXT"
+
+    def test_unknown_ids_are_absent(self, store: Store) -> None:
+        assert store.chunks_by_id([12345]) == {}
+        assert store.chunks_by_id([]) == {}
+
+    def test_more_ids_than_fit_in_one_statement(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        ids = put_chunks(store, docs, "big.txt", *[chunk(n, f"chunk {n}") for n in range(1200)])
+        found = store.chunks_by_id(ids)
+        assert len(found) == 1200
+        assert found[ids[1100]].chunk.text == "chunk 1100"
+
+
+class TestEmbeddings:
+    @staticmethod
+    def vector(*values: float) -> bytes:
+        return struct.pack(f"<{len(values)}f", *values)
+
+    def test_unembedded_chunks_shrink_as_vectors_are_stored(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        a, b = put_chunks(store, docs, "a.txt", chunk(0, "one"), chunk(1, "two"))
+        assert store.unembedded_chunks(docs, "m") == [(a, "one"), (b, "two")]
+        store.put_embeddings("m", 2, [EmbeddingRow(a, self.vector(1, 0))])
+        assert store.unembedded_chunks(docs, "m") == [(b, "two")]
+        assert store.unembedded_chunks(docs, "other") == [(a, "one"), (b, "two")]
+
+    def test_read_back(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        a, b = put_chunks(store, docs, "a.txt", chunk(0, "one"), chunk(1, "two"))
+        store.put_embeddings(
+            "m", 2, [EmbeddingRow(b, self.vector(0, 1)), EmbeddingRow(a, self.vector(1, 0))]
+        )
+        dimension, rows = store.embeddings(docs, "m")
+        assert dimension == 2
+        assert rows == [EmbeddingRow(a, self.vector(1, 0)), EmbeddingRow(b, self.vector(0, 1))]
+        assert store.embeddings(docs, "other") == (0, [])
+
+    def test_storing_again_replaces(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        [a] = put_chunks(store, docs, "a.txt", chunk(0, "one"))
+        store.put_embeddings("m", 2, [EmbeddingRow(a, self.vector(1, 0))])
+        store.put_embeddings("m", 2, [EmbeddingRow(a, self.vector(0, 1))])
+        assert store.embeddings(docs, "m")[1] == [EmbeddingRow(a, self.vector(0, 1))]
+
+    def test_wrong_sized_vectors_are_rejected_and_nothing_is_stored(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        a, b = put_chunks(store, docs, "a.txt", chunk(0, "one"), chunk(1, "two"))
+        with pytest.raises(StoreError, match=f"vector for chunk {b} has 12 bytes, expected 8"):
+            store.put_embeddings(
+                "m", 2, [EmbeddingRow(a, self.vector(1, 0)), EmbeddingRow(b, self.vector(1, 0, 0))]
+            )
+        assert store.embeddings(docs, "m") == (0, [])
+
+    def test_mixed_dimensions_for_one_model_are_an_error(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        a, b = put_chunks(store, docs, "a.txt", chunk(0, "one"), chunk(1, "two"))
+        store.put_embeddings("m", 2, [EmbeddingRow(a, self.vector(1, 0))])
+        store.put_embeddings("m", 3, [EmbeddingRow(b, self.vector(1, 0, 0))])
+        with pytest.raises(StoreError, match="different dimensions"):
+            store.embeddings(docs, "m")
+
+    def test_replacing_a_document_drops_its_vectors(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        [a] = put_chunks(store, docs, "a.txt", chunk(0, "one"))
+        store.put_embeddings("m", 2, [EmbeddingRow(a, self.vector(1, 0))])
+        [new] = put_chunks(store, docs, "a.txt", chunk(0, "uno"), digest="h2")
+        assert store.embeddings(docs, "m") == (0, [])
+        assert store.unembedded_chunks(docs, "m") == [(new, "uno")]
+
+    def test_deleting_a_document_drops_its_vectors(self, store: Store) -> None:
+        docs = store.ensure_collection("docs")
+        [a] = put_chunks(store, docs, "a.txt", chunk(0, "one"))
+        store.put_embeddings("m", 2, [EmbeddingRow(a, self.vector(1, 0))])
+        store.delete_document(docs, "a.txt")
+        count = store._db.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        assert count == 0
