@@ -21,6 +21,7 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "DOCSAGE_CHUNK_OVERLAP",
         "DOCSAGE_EMBEDDER",
         "DOCSAGE_EMBED_MODEL",
+        "DOCSAGE_RERANK_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
 

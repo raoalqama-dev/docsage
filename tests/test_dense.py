@@ -316,6 +316,23 @@ class TestDenseIndex:
         dense = DenseIndex.load(store, collection, embedder.name)
         assert [i for i, _ in dense.search(embedder.embed_query("cat"), 10)] == ids
 
+    def test_vectors_of_chunks_in_the_order_asked(
+        self, index: tuple[DenseIndex, ConceptEmbedder, list[int]]
+    ) -> None:
+        dense, embedder, ids = index
+        vectors = dense.vectors_of([ids[2], ids[0]])
+        assert vectors.shape == (2, embedder.dimension)
+        assert vectors[0].tolist() == embedder.embed_documents(["cats sleep"])[0].tolist()
+        assert vectors[1].tolist() == embedder.embed_documents(["cars cars"])[0].tolist()
+        assert dense.vectors_of([]).shape == (0, embedder.dimension)
+
+    def test_vectors_of_a_chunk_that_is_not_indexed(
+        self, index: tuple[DenseIndex, ConceptEmbedder, list[int]]
+    ) -> None:
+        dense, _, _ = index
+        with pytest.raises(EmbedderError, match="chunk 999 has no vector"):
+            dense.vectors_of([999])
+
     def test_an_empty_index(self, store: Store) -> None:
         collection = store.ensure_collection("docs")
         dense = DenseIndex.load(store, collection, "concepts-test")

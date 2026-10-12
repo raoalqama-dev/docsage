@@ -29,6 +29,11 @@ def test_embedder_settings() -> None:
     assert (settings.embedder, settings.embed_model) == ("fastembed", "org/m")
 
 
+def test_rerank_model() -> None:
+    assert load_settings({}).rerank_model == "Xenova/ms-marco-MiniLM-L-6-v2"
+    assert load_settings({"DOCSAGE_RERANK_MODEL": "org/m"}).rerank_model == "org/m"
+
+
 def test_an_unknown_embedder_is_named() -> None:
     with pytest.raises(ConfigError, match="DOCSAGE_EMBEDDER: Input should be 'hashing' or"):
         load_settings({"DOCSAGE_EMBEDDER": "openai"})

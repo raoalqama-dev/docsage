@@ -229,6 +229,15 @@ class DenseIndex:
     def __len__(self) -> int:
         return len(self.ids)
 
+    def vectors_of(self, chunk_ids: Sequence[int]) -> Vectors:
+        """The vectors of these chunks, one row each in the order given; they must be indexed."""
+        position = {int(chunk_id): row for row, chunk_id in enumerate(self.ids)}
+        try:
+            rows = [position[chunk_id] for chunk_id in chunk_ids]
+        except KeyError as exc:
+            raise EmbedderError(f"chunk {exc.args[0]} has no vector in this index") from None
+        return self.matrix[rows]
+
     def search(self, query: Vectors, limit: int) -> list[tuple[int, float]]:
         """Chunk ids with cosine similarity to ``query``, best first, ties by id.
 

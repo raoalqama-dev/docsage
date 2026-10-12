@@ -10,6 +10,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from docsage.retrieval.dense import DEFAULT_FASTEMBED_MODEL
+from docsage.retrieval.rerank import DEFAULT_RERANK_MODEL
 
 #: Each setting and the environment variable it is read from.
 ENV_VARS: dict[str, str] = {
@@ -18,6 +19,7 @@ ENV_VARS: dict[str, str] = {
     "chunk_overlap": "DOCSAGE_CHUNK_OVERLAP",
     "embedder": "DOCSAGE_EMBEDDER",
     "embed_model": "DOCSAGE_EMBED_MODEL",
+    "rerank_model": "DOCSAGE_RERANK_MODEL",
 }
 
 
@@ -34,6 +36,8 @@ class Settings(BaseModel):
     embedder: Literal["hashing", "fastembed"] = "hashing"
     embed_model: str = Field(default=DEFAULT_FASTEMBED_MODEL, min_length=1)
     """The fastembed model; the hashing embedder has no model."""
+    rerank_model: str = Field(default=DEFAULT_RERANK_MODEL, min_length=1)
+    """The fastembed cross-encoder used by ``--rerank``."""
 
     @model_validator(mode="after")
     def _overlap_below_chunk_size(self) -> Self:

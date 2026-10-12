@@ -13,9 +13,12 @@ from docsage import __version__
 from docsage.config import ConfigError, Settings, load_settings
 from docsage.ingest.chunking import ChunkingOptions
 from docsage.ingest.pipeline import Outcome, ingest
+from docsage.retrieval.context import DEFAULT_DUPLICATE_THRESHOLD, Context, assemble_context
 from docsage.retrieval.dense import EmbedderError, create_embedder
 from docsage.retrieval.fusion import DEFAULT_K
-from docsage.retrieval.search import Hit, Mode, search
+from docsage.retrieval.rerank import DEFAULT_MMR_LAMBDA, RerankerError, create_reranker
+from docsage.retrieval.retrieve import retrieve
+from docsage.retrieval.search import Hit, Mode
 from docsage.store import Store, StoreError
 
 EXIT_OK = 0
@@ -58,6 +61,30 @@ def _weight(text: str) -> float:
         raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
     if not math.isfinite(value) or value < 0:
         raise argparse.ArgumentTypeError("must be a finite number, not negative")
+    return value
+
+
+def _score(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    return value
+
+
+def _unit_interval(text: str) -> float:
+    value = _score(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return value
+
+
+def _threshold(text: str) -> float:
+    value = _unit_interval(text)
+    if value == 0.0:
+        raise argparse.ArgumentTypeError("must be above 0")
     return value
 
 
@@ -111,7 +138,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Search a collection with BM25, dense vectors, or both fused with reciprocal "
             "rank fusion. Dense and hybrid searches embed any chunks that have no vector "
-            "yet, which is slow only the first time."
+            "yet, which is slow only the first time. The best candidates can then be "
+            "reranked with a cross-encoder, filtered by score, diversified with MMR and "
+            "assembled into a context of limited size."
         ),
     )
     search_parser.add_argument("query", metavar="QUERY")
@@ -159,6 +188,58 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_K,
         metavar="K",
         help=f"the rank constant of reciprocal rank fusion (default: {DEFAULT_K})",
+    )
+    search_parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="rerank the candidates with a cross-encoder (needs the rerank extra)",
+    )
+    search_parser.add_argument(
+        "--candidates",
+        type=_positive_int,
+        metavar="N",
+        help="candidates to rerank, filter and diversify (default: 3 x k, at least 30)",
+    )
+    search_parser.add_argument(
+        "--min-score",
+        type=_score,
+        metavar="S",
+        help="drop results scoring below S (the reranker's score with --rerank)",
+    )
+    search_parser.add_argument(
+        "--mmr",
+        action="store_true",
+        help="diversify the results with maximal marginal relevance",
+    )
+    search_parser.add_argument(
+        "--mmr-lambda",
+        type=_unit_interval,
+        default=DEFAULT_MMR_LAMBDA,
+        metavar="L",
+        help=f"MMR's weight of relevance against variety, 0 to 1 (default: {DEFAULT_MMR_LAMBDA})",
+    )
+    search_parser.add_argument(
+        "--context-tokens",
+        type=_positive_int,
+        metavar="N",
+        help="also assemble the results into a context of at most N tokens",
+    )
+    search_parser.add_argument(
+        "--neighbours",
+        type=_non_negative_int,
+        default=1,
+        metavar="N",
+        help="chunks to add on each side of a result while the context has room (default: 1)",
+    )
+    search_parser.add_argument(
+        "--duplicate-threshold",
+        type=_threshold,
+        default=DEFAULT_DUPLICATE_THRESHOLD,
+        metavar="T",
+        help=(
+            "the share of word triples that makes two chunks duplicates "
+            f"(default: {DEFAULT_DUPLICATE_THRESHOLD})"
+        ),
     )
 
     commands.add_parser(
@@ -218,7 +299,7 @@ def _location(hit: Hit) -> str:
 
 
 def _ranks(hit: Hit) -> str:
-    ranks = [("bm25", hit.bm25_rank), ("dense", hit.dense_rank)]
+    ranks = [("bm25", hit.bm25_rank), ("dense", hit.dense_rank), ("first", hit.first_rank)]
     return ", ".join(f"{name} #{rank}" for name, rank in ranks if rank is not None)
 
 
@@ -227,33 +308,74 @@ def cmd_search(args: argparse.Namespace, settings: Settings, out: TextIO, err: T
     if not path.exists():
         raise CommandError(f"no database at {path}; run docsage ingest first")
     embedder = None
-    if args.mode is not Mode.BM25:
+    if args.mode is not Mode.BM25 or args.mmr:
         embedder = create_embedder(args.embedder or settings.embedder, settings.embed_model)
+    reranker = create_reranker(settings.rerank_model) if args.rerank else None
     with Store(path) as store:
         collection = store.collection(args.collection)
         if collection is None:
             raise CommandError(f"no collection {args.collection!r}")
-        result = search(
-            store,
-            collection,
-            args.query,
-            mode=args.mode,
-            k=args.k,
-            embedder=embedder,
-            bm25_weight=args.bm25_weight,
-            dense_weight=args.dense_weight,
-            rrf_k=args.rrf_k,
-        )
+        try:
+            result = retrieve(
+                store,
+                collection,
+                args.query,
+                mode=args.mode,
+                k=args.k,
+                embedder=embedder,
+                bm25_weight=args.bm25_weight,
+                dense_weight=args.dense_weight,
+                rrf_k=args.rrf_k,
+                reranker=reranker,
+                candidates=args.candidates,
+                min_score=args.min_score,
+                mmr_lambda=args.mmr_lambda if args.mmr else None,
+            )
+        except ValueError as exc:
+            raise CommandError(str(exc)) from None
+        context = None
+        if args.context_tokens and result.hits:
+            context = assemble_context(
+                store,
+                result.hits,
+                args.context_tokens,
+                neighbours=args.neighbours,
+                duplicate_threshold=args.duplicate_threshold,
+            )
     if embedder and result.embedded:
         err.write(f"embedded {result.embedded} chunks with {embedder.name}\n")
     if not result.hits:
         out.write("no results\n")
         return EXIT_OK
+    show_ranks = args.mode is Mode.HYBRID or reranker is not None
     for position, hit in enumerate(result.hits, start=1):
-        detail = f"  [{_ranks(hit)}]" if args.mode is Mode.HYBRID else ""
+        detail = f"  [{_ranks(hit)}]" if show_ranks else ""
         out.write(f"{position:>2}  {hit.score:.4f}  {_location(hit)}{detail}\n")
         out.write(f"      {_snippet(hit.chunk.chunk.text)}\n")
+    if context is not None:
+        _write_context(context, out)
     return EXIT_OK
+
+
+def _write_context(context: Context, out: TextIO) -> None:
+    count = len(context.passages)
+    notes = []
+    if context.duplicates:
+        notes.append(f"{context.duplicates} duplicate{'' if context.duplicates == 1 else 's'}")
+    if context.skipped:
+        notes.append(f"{context.skipped} too big for the budget")
+    extra = f" ({', '.join(notes)} dropped)" if notes else ""
+    out.write(
+        f"\ncontext: {count} passage{'' if count == 1 else 's'}, "
+        f"{context.tokens} of {context.budget} tokens{extra}\n"
+    )
+    for number, passage in enumerate(context.passages, start=1):
+        pages = ""
+        if passage.page is not None:
+            same = passage.page == passage.page_end
+            pages = f"  p.{passage.page}" if same else f"  p.{passage.page}-{passage.page_end}"
+        path = " > ".join((passage.source, *passage.heading_path))
+        out.write(f"\n[{number}] {path}{pages}\n{passage.text}\n")
 
 
 def cmd_collections(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:
@@ -294,6 +416,6 @@ def main(
     try:
         settings = load_settings()
         return COMMANDS[args.command](args, settings, out, err)
-    except (CommandError, ConfigError, EmbedderError, StoreError) as exc:
+    except (CommandError, ConfigError, EmbedderError, RerankerError, StoreError) as exc:
         err.write(f"docsage: {exc}\n")
         return EXIT_USAGE
