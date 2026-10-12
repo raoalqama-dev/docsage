@@ -9,11 +9,12 @@ guessing. It talks to any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio or
 a hosted API) over plain HTTP with no vendor SDK, and runs its embedding and
 reranking models locally.
 
-**Status:** early development. Ingestion and search work: Markdown, text, HTML
-and PDF files are split into chunks that follow their headings and stored in a
-single SQLite file, and `docsage search` finds them by BM25, by dense vectors or
-by both fused. Reranking, answers and evaluation are next on the
-[roadmap](#roadmap).
+**Status:** early development. Ingestion and retrieval work: Markdown, text,
+HTML and PDF files are split into chunks that follow their headings and stored
+in a single SQLite file, and `docsage search` finds them by BM25, by dense
+vectors or by both fused, can rerank them with a cross-encoder, drop weak and
+repeated ones, and assemble what is left into a context of limited size.
+Answers and evaluation are next on the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -147,6 +148,9 @@ Each document records the SHA-256 of its file and the pipeline that chunked it
 docsage search QUERY [--collection NAME] [--mode bm25|dense|hybrid] [-k 10]
 ```
 
+(Reranking, MMR and context assembly are options of the same command, described
+[below](#reranking-and-context).)
+
 Each result shows its rank, score, source with heading path and PDF pages, and
 the start of the chunk. In hybrid mode it also shows the position the chunk had
 in each retriever's list, so you can see which one found it. Scores mean
@@ -223,6 +227,128 @@ fixture corpus with a test embedder that maps synonyms to the same dimension: a
 keyword-only match that dense retrieval misses, and a paraphrase-only match
 with no word in common with the query that BM25 misses. Hybrid returns both.
 
+## Reranking and context
+
+First-stage retrieval is cheap and approximate. Three optional stages follow it,
+all part of `docsage search`, and a fourth turns the results into text for a
+model. Each is also a plain function: `retrieve()` runs the stages up to MMR and
+`assemble_context()` builds the context.
+
+### Reranking
+
+```sh
+pip install 'docsage[rerank]'
+docsage search "how do servers compact the log" -c notes -k 3 --rerank
+```
+
+```text
+ 1  8.8316  raft-mirror.md > Raft summary  [bm25 #2, dense #1, first #1]
+      Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers. The snapshot records the index and term of the last entry it replaces, so the log can cont...
+ 2  8.5260  raft.md > Raft notes > Snapshots  [bm25 #3, dense #2, first #3]
+      Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers. The snapshot records the index and term of the last entry it replaces, so the log can cont...
+ 3  5.3156  raft.md > Raft notes > Snapshots  [bm25 #1, dense #3, first #2]
+      Compaction runs independently on each server, once the log passes a size threshold.
+```
+
+(Run against three small notes ingested with `--chunk-tokens 60 --overlap 15`,
+`raft.md`, `raft-mirror.md` and `troubleshooting.md`, with the hashing embedder
+and the default cross-encoder.)
+
+A `Reranker` scores passages against a query by reading both together, which is
+far more accurate than comparing precomputed vectors and far slower, so it only
+sees the best candidates of the first stage: `--candidates N`, by default three
+times `-k` and at least 30. The reranker's score replaces the search's score,
+and `first #N` shows where the search had put the result. The reranker reads
+each chunk's heading path followed by its text.
+
+The included implementation is a local ONNX cross-encoder through fastembed
+(any model on fastembed's cross-encoder list), `Xenova/ms-marco-MiniLM-L-6-v2` unless
+`DOCSAGE_RERANK_MODEL` names another. The model is downloaded on first use.
+Cross-encoder scores are raw model outputs: they can be negative, and their
+scale differs between models, so they only mean something within one search.
+Anything with a `name` and a `score(query, passages)` method is a `Reranker`.
+
+### Minimum score
+
+`--min-score S` drops results scoring below `S`, so a query the collection
+cannot answer returns nothing rather than its least bad chunks. It compares the
+reranker's score when `--rerank` is given and the search's own score otherwise
+(a BM25 score, a cosine similarity or a fused score, depending on `--mode`),
+so pick the value by looking at the scores of your model on your collection.
+
+```sh
+docsage search "how do servers compact the log" -c notes -k 5 --rerank --min-score 6
+```
+
+```text
+ 1  8.8316  raft-mirror.md > Raft summary  [bm25 #2, dense #1, first #1]
+      Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers. The snapshot records the index and term of the last entry it replaces, so the log can cont...
+ 2  8.5260  raft.md > Raft notes > Snapshots  [bm25 #3, dense #2, first #3]
+      Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers. The snapshot records the index and term of the last entry it replaces, so the log can cont...
+```
+
+### Diversity: MMR
+
+`--mmr` picks the results one by one by maximal marginal relevance: each pick
+maximises `λ * relevance - (1 - λ) * redundancy`, where redundancy is the
+highest cosine similarity between the candidate's vector and the vectors of the
+results already picked. Relevance is rescaled to 0..1 across the candidates
+first, so it can be weighed against a similarity whatever the scale of the
+scores. `--mmr-lambda` (default 0.7) sets `λ`: 1 is plain ranking, lower values
+favour variety. The first pick is always the most relevant. MMR compares chunks
+by their vectors, so it embeds with `--embedder` even in a `bm25` search.
+
+### Context assembly
+
+`--context-tokens N` assembles the results into passages of at most `N` tokens
+(counted as ingestion counts them) and prints them after the results:
+
+```sh
+docsage search "how do servers compact the log" -c notes -k 3 --mmr --context-tokens 200
+```
+
+```text
+context: 2 passages, 168 of 200 tokens (1 duplicate dropped)
+
+[1] raft-mirror.md > Raft summary
+Servers compact their log by writing a snapshot of the state machine and discarding the entries it covers. The snapshot records the index and term of the last entry it replaces, so the log can continue from there.
+
+A follower that is far behind receives the leader's snapshot in place of the individual entries.
+
+[2] raft.md > Raft notes > Snapshots
+A follower that is far behind receives the leader's snapshot instead of the individual entries. Installing a snapshot replaces the follower's state machine and drops any log entries the snapshot covers.
+
+Compaction runs independently on each server, once the log passes a size threshold.
+```
+
+(The three results printed before the context are omitted here.) The results are taken
+in rank order, then:
+
+- **Near-duplicates are collapsed.** A chunk is a duplicate of a better-ranked
+  one when they share at least 90% of the shorter one's word triples
+  (`--duplicate-threshold`), which catches the same passage in two files, a
+  copy with an edit, and a chunk contained in a longer one. The better-ranked
+  copy stays; the report counts the others. In the example above,
+  `raft-mirror.md` repeats the first chunk of the Snapshots section, and only
+  the mirror is kept.
+- **Chunks that follow each other overlap on purpose and are never duplicates
+  of one another.** They are merged into one passage instead, with the repeated
+  sentences removed: the overlap is found as the longest start of the second
+  chunk that ends the first on a word boundary (at least 12 characters, so a
+  word that happens to end one chunk and begin the next is left alone).
+- **A chunk that does not fit in the budget left is skipped** and counted, and a
+  smaller one further down can still use the room.
+- **Neighbours fill what is left.** While budget remains, the chunks before and
+  after each result are added (`--neighbours N`, default 1 on each side), nearest
+  first and best result first, so a passage is not cut off mid-thought. Only
+  chunks of the same section qualify, so a passage never crosses a heading.
+
+The budget is spent chunk by chunk on the chunks' stored token counts. Merging
+only removes text, so the passages can total less than the budget, never more:
+the tokens printed are counted on the final text, and the tests check the bound
+for twelve budgets from 1 to 1000 tokens. Tokens are estimates (see
+[Chunking](#chunking)), not a model's tokenizer.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -232,6 +358,7 @@ with no word in common with the query that BM25 misses. Hybrid returns both.
 | `DOCSAGE_CHUNK_OVERLAP` | `60` | tokens each chunk repeats from the previous one; less than the budget |
 | `DOCSAGE_EMBEDDER` | `hashing` | `hashing` or `fastembed` |
 | `DOCSAGE_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | the fastembed model |
+| `DOCSAGE_RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | the fastembed cross-encoder used by `--rerank` |
 
 Command-line options take precedence over the environment. An invalid value is
 reported with its variable's name, and the command exits with status 2.
@@ -240,7 +367,7 @@ reported with its variable's name, and the command exits with status 2.
 
 - [x] Ingestion: loaders, chunking, the SQLite store and `docsage ingest`
 - [x] Hybrid retrieval: BM25 through SQLite FTS5, dense vectors, reciprocal rank fusion and `docsage search`
-- [ ] Reranking with a cross-encoder, MMR and context assembly
+- [x] Reranking with a cross-encoder, MMR and context assembly
 - [ ] Answers with citations from any OpenAI-compatible endpoint: `docsage ask`
 - [ ] An evaluation suite: retrieval and answer metrics, and `docsage eval`
 - [ ] An HTTP API with FastAPI, and Docker
@@ -249,7 +376,7 @@ reported with its variable's name, and the command exits with status 2.
 ## Development
 
 ```sh
-pip install -e ".[dev,embed]"
+pip install -e ".[dev,embed,rerank]"
 ruff check . && ruff format --check .
 mypy
 pytest --cov
@@ -257,7 +384,7 @@ pytest --cov
 
 CI runs the same checks, the tests on Python 3.11 to 3.14 with every extra
 installed, and the tests again against the oldest dependency versions
-`pyproject.toml` allows, once for the core and once with the `embed` extra. The
-tests build their fixture documents, PDFs included, as they run. Embedders in
-the tests are fakes, so no model is downloaded; one test only checks that the
-installed fastembed offers the methods docsage calls.
+`pyproject.toml` allows, once for the core and once for each extra. The tests
+build their fixture documents, PDFs included, as they run. Embedders and
+rerankers in the tests are fakes, so no model is downloaded; two tests only
+check that the installed fastembed offers the methods docsage calls.
