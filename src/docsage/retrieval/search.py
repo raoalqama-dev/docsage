@@ -27,13 +27,16 @@ class Hit:
     ``score`` is the BM25 score, the cosine similarity or the fused score,
     depending on the mode, so only compare scores within one search. The ranks
     are the chunk's 1-based positions in each retriever's own list, and are
-    ``None`` where that retriever did not return it.
+    ``None`` where that retriever did not return it. A reranker replaces the
+    score with its own and records the position the search had given the hit
+    as ``first_rank``.
     """
 
     chunk: StoredChunk
     score: float
     bm25_rank: int | None = None
     dense_rank: int | None = None
+    first_rank: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
